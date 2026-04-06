@@ -1,0 +1,124 @@
+# A股每周选股自动化工作流
+# 每周日 20:00 (UTC 12:00) 自动运行
+
+name: A股每周选股
+
+on:
+  schedule:
+    - cron: "0 12 * * 0"  # UTC 12:00 = 北京时间 20:00 (周日)
+  workflow_dispatch:  # 支持手动触发
+
+concurrency:
+  group: astock-weekly-pick
+  cancel-in-progress: false
+
+jobs:
+  stock-selection:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Run stock selection
+        id: selection
+        shell: pwsh
+        run: |
+          Write-Host "========================================"
+          Write-Host "A股每周选股系统"
+          Write-Host "========================================"
+          
+          # 1. 获取股票列表
+          Write-Host "[1/2] 获取股票列表..."
+          $headers = @{ 'User-Agent' = 'Mozilla/5.0' }
+          $url = 'https://push2.eastmoney.com/api/qt/clist/get?cb=&pn=1&pz=3000&po=1&np=1&ut=bd1d9ddb04089700511f6f89d92991d5&fltt=2&invt=2&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23&fields=f12,f14,f2,f3,f20'
+          $resp = Invoke-RestMethod -Uri $url -Headers $headers -TimeoutSec 30
+          
+          $stocks = @()
+          foreach ($s in $resp.data.diff) {
+            $code = $s.f12; $name = $s.f14; $price = $s.f2
+            $mv = $s.f20 / 100000000
+            if ($name -match 'ST|退|\*') { continue }
+            if ($code -like '300*' -or $code -like '688*' -or $code -like '8*' -or $code -like '4*') { continue }
+            if ($price -ge 30 -or $price -le 0) { continue }
+            if ($mv -lt 30 -or $mv -gt 150) { continue }
+            $stocks += [PSCustomObject]@{ Code=$code; Name=$name; Price=$price; MV=[Math]::Round($mv,2) }
+          }
+          Write-Host "筛选后: $($stocks.Count) 只股票"
+          
+          # 2. 技术分析
+          Write-Host "[2/2] 技术分析..."
+          $results = @()
+          foreach ($s in $stocks | Select-Object -First 50) {
+            $market = if ($s.Code -like '6*') { 1 } else { 0 }
+            $klineUrl = "https://push2his.eastmoney.com/api/qt/stock/kline/get?cb=&secid=$market.$($s.Code)&ut=fa5fd1943c734e9f7ad383c97b4f4c5d&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61&klt=101&fqt=1&end=20500101&lmt=30"
+            try {
+              $kdata = Invoke-RestMethod -Uri $klineUrl -TimeoutSec 5
+              if ($kdata.data.klines) {
+                $klines = $kdata.data.klines
+                $last = $klines[-1] -split ','
+                $first = $klines[0] -split ','
+                $monthChange = [Math]::Round((($last[2] - $first[2]) / $first[2]) * 100, 2)
+                $volToday = [double]$last[5]
+                $vols = $klines | ForEach-Object { ($_ -split ',')[5] }
+                $volAvg = ($vols | Select-Object -Last 20 | Measure-Object -Average).Average
+                $volRatio = [Math]::Round($volToday / $volAvg, 2)
+                $score = 0; $signals = @()
+                if ($monthChange -gt 10) { $score += 20; $signals += "Month +$monthChange%" }
+                if ($volRatio -gt 1.5) { $score += 15; $signals += "Vol x$volRatio" }
+                if ($last[7] -gt 5) { $score += 10; $signals += "Today +$($last[7])%" }
+                if ($score -ge 25) {
+                  $results += [PSCustomObject]@{ Code=$s.Code; Name=$s.Name; Price=$s.Price; MV=$s.MV; Score=$score; Signals=($signals -join ', ') }
+                }
+              }
+            } catch {}
+          }
+          $results = $results | Sort-Object Score -Descending
+          Write-Host "筛选出: $($results.Count) 只潜力股"
+          
+          # 输出Top 3
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "本周精选股票 (Top 3)"
+          Write-Host "========================================"
+          $top3 = $results | Select-Object -First 3
+          for ($i = 0; $i -lt $top3.Count; $i++) {
+            $s = $top3[$i]
+            Write-Host "$($i+1). $($s.Code) $($s.Name) - Price: $($s.Price), Score: $($s.Score)"
+          }
+          
+          # 保存结果
+          $date = Get-Date -Format "yyyyMMdd"
+          $output = @{ timestamp = (Get-Date -Format "yyyy-MM-dd HH:mm:ss"); top_stocks = $top3 }
+          $output | ConvertTo-Json -Depth 5 | Out-File "weekly_pick_$date.json" -Encoding UTF8
+          
+          # GitHub输出
+          $summary = ($top3 | ForEach-Object { "$($_.Code) $($_.Name) - Price: $($_.Price), Score: $($_.Score)" }) -join "`n"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "result<<EOF`n$summary`nEOF"
+      
+      - name: Save results
+        run: |
+          DATE=$(date +%Y%m%d)
+          mkdir -p results
+          mv weekly_pick_*.json results/ 2>/dev/null || echo "No result file"
+      
+      - name: Commit results
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add results/ 2>/dev/null || true
+          git diff --quiet && git diff --staged --quiet || git commit -m "Weekly stock pick $(date +%Y-%m-%d)"
+          git push
+      
+      - name: Create Issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DATE=$(date +%Y-%m-%d)
+          RESULT="${{ steps.selection.outputs.result }}"
+          if [ -n "$RESULT" ]; then
+            gh issue create \
+              --title "Weekly Stock Pick $DATE" \
+              --body "## Top 3 Stocks\n\n$RESULT\n\n---\nRisk Warning: AI prediction, not investment advice" \
+              --label "weekly-pick" || echo "Issue skipped"
+          fi

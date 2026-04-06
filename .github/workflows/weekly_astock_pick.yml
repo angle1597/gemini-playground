@@ -1,0 +1,190 @@
+# A股每周选股自动化工作流
+# 每周日 20:00 (UTC 12:00) 自动运行
+# 结果自动推送到飞书
+
+name: A股每周选股
+
+on:
+  schedule:
+    - cron: "0 12 * * 0"  # UTC 12:00 = 北京时间 20:00 (周日)
+  workflow_dispatch:  # 支持手动触发
+
+concurrency:
+  group: astock-weekly-pick
+  cancel-in-progress: false
+
+env:
+  SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
+  ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+  TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+  FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+
+jobs:
+  stock-selection:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      - name: Install dependencies
+        run: |
+          npm install axios
+      
+      - name: Run stock selection
+        id: selection
+        run: |
+          echo "开始A股选股分析..."
+          
+          # 创建选股脚本
+          cat > select_stocks.js << 'EOF'
+          const https = require('https');
+          const http = require('http');
+          
+          const CONFIG = {
+            minMarketCap: 30,
+            maxMarketCap: 150,
+            maxPrice: 30,
+            topN: 3
+          };
+          
+          const httpGet = (url) => new Promise((resolve, reject) => {
+            const client = url.startsWith('https') ? https : http;
+            client.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+              let data = '';
+              res.on('data', (chunk) => data += chunk);
+              res.on('end', () => resolve(data));
+            }).on('error', reject);
+          });
+          
+          async function getStockList() {
+            const url = 'https://push2.eastmoney.com/api/qt/clist/get?cb=&pn=1&pz=3000&po=1&np=1&ut=bd1d9ddb04089700511f6f89d92991d5&fltt=2&invt=2&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23&fields=f12,f14,f2,f3,f20';
+            const data = await httpGet(url);
+            const json = JSON.parse(data);
+            
+            const stocks = [];
+            for (const item of json.data.diff) {
+              const code = item.f12, name = item.f14, price = item.f2;
+              const mv = item.f20 / 100000000;
+              
+              if (name.includes('ST') || name.includes('退')) continue;
+              if (code.startsWith('300') || code.startsWith('688')) continue;
+              if (code.startsWith('8') || code.startsWith('4')) continue;
+              if (price <= 0 || price >= CONFIG.maxPrice) continue;
+              if (mv < CONFIG.minMarketCap || mv > CONFIG.maxMarketCap) continue;
+              
+              stocks.push({ code, name, price, mv: Math.round(mv * 100) / 100, change: item.f3 });
+            }
+            return stocks;
+          }
+          
+          async function getKLine(code, days = 30) {
+            const market = code.startsWith('6') ? 1 : 0;
+            const url = `https://push2his.eastmoney.com/api/qt/stock/kline/get?cb=&secid=${market}.${code}&ut=fa5fd1943c734e9f7ad383c97b4f4c5d&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61&klt=101&fqt=1&end=20500101&lmt=${days}`;
+            try {
+              const data = await httpGet(url);
+              const json = JSON.parse(data);
+              if (json.data?.klines) {
+                return json.data.klines.map(line => {
+                  const p = line.split(',');
+                  return { close: +p[2], vol: +p[5], pct: +p[7] };
+                });
+              }
+            } catch (e) {}
+            return [];
+          }
+          
+          async function main() {
+            console.log('获取股票列表...');
+            const stocks = await getStockList();
+            console.log(`共${stocks.length}只股票`);
+            
+            const results = [];
+            for (const stock of stocks.slice(0, 50)) {
+              const klines = await getKLine(stock.code, 30);
+              if (klines.length < 20) continue;
+              
+              const closes = klines.map(k => k.close);
+              const vols = klines.map(k => k.vol);
+              
+              let score = 0;
+              const signals = [];
+              
+              const ma5 = closes.slice(-5).reduce((a, b) => a + b, 0) / 5;
+              const ma10 = closes.slice(-10).reduce((a, b) => a + b, 0) / 10;
+              const ma20 = closes.slice(-20).reduce((a, b) => a + b, 0) / 20;
+              
+              if (ma5 > ma10 && ma10 > ma20) { score += 20; signals.push('均线多头'); }
+              
+              const volRatio = vols[vols.length - 1] / (vols.slice(-20, -1).reduce((a, b) => a + b, 0) / 19);
+              if (volRatio > 1.5) { score += 15; signals.push(`放量${volRatio.toFixed(1)}倍`); }
+              
+              const change10d = (closes[closes.length - 1] - closes[closes.length - 10]) / closes[closes.length - 10] * 100;
+              if (change10d > 10) { score += 10; signals.push(`10日涨${change10d.toFixed(1)}%`); }
+              
+              if (score >= 30) {
+                results.push({ ...stock, score, signals: signals.join(', ') });
+              }
+            }
+            
+            results.sort((a, b) => b.score - a.score);
+            const top3 = results.slice(0, CONFIG.topN);
+            
+            console.log('\n本周精选股票:');
+            top3.forEach((s, i) => {
+              console.log(`${i+1}. ${s.code} ${s.name} - 现价${s.price}元, 市值${s.mv}亿, 评分${s.score}分`);
+            });
+            
+            // 保存结果
+            const fs = require('fs');
+            const output = {
+              timestamp: new Date().toISOString(),
+              top_stocks: top3
+            };
+            fs.writeFileSync('weekly_result.json', JSON.stringify(output, null, 2));
+            
+            // 设置GitHub输出
+            const outputStr = top3.map((s, i) => `${i+1}. ${s.code} ${s.name}`).join('\\n');
+            console.log(`::set-output name=result::${outputStr}`);
+          }
+          
+          main().catch(console.error);
+          EOF
+          
+          node select_stocks.js
+      
+      - name: Save results
+        run: |
+          DATE=$(date +%Y%m%d)
+          mv weekly_result.json results/weekly_pick_${DATE}.json || mkdir -p results && mv weekly_result.json results/weekly_pick_${DATE}.json
+          
+      - name: Commit results
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add results/
+          git diff --quiet && git commit -m "每周选股结果 $(date +%Y-%m-%d)" || echo "No changes"
+          git push
+      
+      - name: Notify Feishu
+        if: env.FEISHU_WEBHOOK != ''
+        run: |
+          RESULT=$(cat results/weekly_pick_*.json | tail -1)
+          curl -X POST "${{ secrets.FEISHU_WEBHOOK }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"📊 A股每周选股结果\n\n${{ steps.selection.outputs.result }}\n\n⚠️ 风险提示: 以上为AI分析预测，不构成投资建议\"}}"
+      
+      - name: Create Issue
+        run: |
+          DATE=$(date +%Y-%m-%d)
+          gh issue create \
+            --title "每周选股结果 $DATE" \
+            --body "## 本周精选股票\n\n${{ steps.selection.outputs.result }}\n\n---\n⚠️ 风险提示: 以上为AI分析预测，不构成投资建议" \
+            --label "weekly-pick" || echo "Issue creation skipped"
+        env:
+          GH_TOKEN: ${{ github.token }}
