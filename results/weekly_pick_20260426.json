@@ -1,0 +1,29 @@
+{
+  "timestamp": "2026-04-26 13:12:13",
+  "top_stocks": [
+    {
+      "Code": "603390",
+      "Name": "通达电气",
+      "Price": 14.6,
+      "MV": 51.34,
+      "Score": 45,
+      "Signals": "Month +19.87%, Vol x8.41, Today +7.01%"
+    },
+    {
+      "Code": "603967",
+      "Name": "中创物流",
+      "Price": 14.73,
+      "MV": 51.06,
+      "Score": 45,
+      "Signals": "Month +13.22%, Vol x2.64, Today +6.05%"
+    },
+    {
+      "Code": "000889",
+      "Name": "中嘉博创",
+      "Price": 4.79,
+      "MV": 44.85,
+      "Score": 35,
+      "Signals": "Month +38.44%, Vol x1.71"
+    }
+  ]
+}
