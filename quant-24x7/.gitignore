@@ -1,0 +1,50 @@
+# Ignore temp directories
+*_temp/
+__pycache__/
+*.pyc
+*.db
+logs/
+data/
+reports/
+.env
+
+# Temp scripts
+_*.py
+_*.ps1
+_*.bat
+hb_*.py
+hb_*.bat
+hb_*.ps1
+chk_*.py
+chk_*.bat
+chk_*.ps1
+tmp_*.py
+
+# Simulation results
+simulation_results/
+
+# DownKyi
+*.zip
+downkyi/
+DownKyi*/
+
+# Memory logs (contain API keys)
+memory/
+*.md.bak
+
+# Supervisor/task summaries (workspace root)
+../*supervisor*.md
+../*task-summary*.md
+../*quant-auto-loop*.md
+../*quant-strategy*.md
+../*heartbeat-summary*.md
+../*check*.md
+../*_disk_check*
+../*_hb*.py
+../*_v100_out*
+../*chk*.*
+../*hb_*.*
+../*db_check*
+../*downkyi*/
+../*DownKyi*
+../*tmp_*
